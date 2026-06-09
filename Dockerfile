@@ -322,4 +322,10 @@ RUN mkdir -p /opt/data
 # exit code. Without the wrapper-as-ENTRYPOINT, leading-dash args
 # like `--version` would be intercepted by /init's POSIX shell.
 ENTRYPOINT [ "/init", "/opt/hermes/docker/main-wrapper.sh" ]
-CMD [ ]
+# Avocado Railway deploy: default the container's main program to the gateway
+# (the supported server pattern — see docker-compose.yml `command: ["gateway",
+# "run"]`). main-wrapper routes this to `hermes gateway run` under s6. We bake
+# it into CMD instead of a Railway `startCommand` because Railway's start
+# command OVERRIDES the ENTRYPOINT, which would bypass /init (s6) entirely and
+# fail with "executable `gateway` could not be found". Re-check on upstream sync.
+CMD [ "gateway", "run" ]
