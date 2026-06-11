@@ -32,6 +32,21 @@ provisioning (by hand) is proven; self-serve (HTTP) is the next build.
 5. hermes_cli/container_boot.py: auto-start ALL registered profiles on container
    boot unless a `.paused` marker exists (upstream only revives state "running",
    which leaves every bot down after any redeploy — see Validation #4).
+6. API-server per-end-user multiplexing (gateway/platforms/api_server.py +
+   tools/mcp_tool.py): /v1/chat/completions accepts two optional headers from
+   the Avocado app backend —
+   - `x-avocado-user-id`: mixed into the derived session ID and used as the
+     default long-term memory scope, so different end users never share
+     sessions/memory through the one shared API profile.
+   - `x-avocado-mcp-key`: overrides the mcp_servers.avocado Authorization
+     for that run only, so generations bill the END USER's Avocado account.
+     Implementation: MCP connections are pooled globally with auth baked in
+     at connect time, so the override routes tool calls to a per-user pooled
+     connection keyed by a fingerprint of the override headers (lazy
+     connect, FAIL CLOSED — a bad key returns an error rather than falling
+     back to the profile's default key and billing the wrong tenant).
+   Requests without these headers behave exactly as upstream. Both headers
+   require API_SERVER_KEY auth; key values are never logged.
 
 ## How it runs (architecture)
 - /init (s6-overlay) is PID 1. It runs cont-init hooks, starts s6-rc services,

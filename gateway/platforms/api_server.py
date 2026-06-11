@@ -673,6 +673,7 @@ def _make_request_fingerprint(body: Dict[str, Any], keys: List[str]) -> str:
 def _derive_chat_session_id(
     system_prompt: Optional[str],
     first_user_message: str,
+    identity: str = "",
 ) -> str:
     """Derive a stable session ID from the conversation's first user message.
 
@@ -682,8 +683,15 @@ def _derive_chat_session_id(
     them produces a deterministic session ID that lets the API server reuse
     the same Hermes session (and therefore the same Docker container sandbox
     directory) across turns.
+
+    AVOCADO FORK: ``identity`` (the ``x-avocado-user-id`` header) is mixed
+    into the seed so two different end users sending the same first message
+    never collide into one session. Empty identity preserves the exact
+    upstream seed (and therefore all existing session IDs).
     """
     seed = f"{system_prompt or ''}\n{first_user_message}"
+    if identity:
+        seed = f"{identity}\n{seed}"
     digest = hashlib.sha256(seed.encode("utf-8")).hexdigest()[:16]
     return f"api-{digest}"
 
@@ -978,6 +986,56 @@ class APIServerAdapter(BasePlatformAdapter):
             )
 
         return raw, None
+
+    def _parse_avocado_headers(
+        self, request: "web.Request"
+    ) -> tuple:
+        """AVOCADO FORK: extract per-end-user multiplexing headers.
+
+        The Avocado app proxies many end users through this one API server
+        and sends two optional headers on each request:
+
+        - ``x-avocado-user-id`` — stable end-user identity. Mixed into the
+          derived session ID and used as the default long-term memory scope
+          so different end users never share sessions/memory.
+        - ``x-avocado-mcp-key`` — that user's own Avocado MCP bearer key.
+          Overrides the ``mcp_servers.avocado`` Authorization header for
+          this run only, so generations bill the END USER's account.
+
+        Returns ``(user_id, mcp_key, error_response_or_None)``. Requests
+        without these headers behave exactly as upstream. Like the other
+        caller-supplied scoping headers, both require API-key auth. The
+        MCP key value is NEVER logged.
+        """
+        user_id = (request.headers.get("x-avocado-user-id") or "").strip()
+        mcp_key = (request.headers.get("x-avocado-mcp-key") or "").strip()
+        if not user_id and not mcp_key:
+            return None, None, None
+
+        if not self._api_key:
+            logger.warning(
+                "x-avocado-* headers rejected: no API key configured. "
+                "Set API_SERVER_KEY to enable per-user multiplexing."
+            )
+            return None, None, web.json_response(
+                _openai_error(
+                    "x-avocado-* headers require API key authentication. "
+                    "Configure API_SERVER_KEY to enable this feature."
+                ),
+                status=403,
+            )
+
+        for label, value, max_len in (
+            ("x-avocado-user-id", user_id, 128),
+            ("x-avocado-mcp-key", mcp_key, 512),
+        ):
+            if value and (len(value) > max_len or re.search(r"[\r\n\x00\s]", value)):
+                return None, None, web.json_response(
+                    {"error": {"message": f"Invalid {label} header", "type": "invalid_request_error"}},
+                    status=400,
+                )
+
+        return user_id or None, mcp_key or None, None
 
     # ------------------------------------------------------------------
     # Session DB helper
@@ -1785,6 +1843,19 @@ class APIServerAdapter(BasePlatformAdapter):
         if key_err is not None:
             return key_err
 
+        # AVOCADO FORK: per-end-user multiplexing (see _parse_avocado_headers).
+        avocado_user_id, avocado_mcp_key, avocado_err = self._parse_avocado_headers(request)
+        if avocado_err is not None:
+            return avocado_err
+        if avocado_user_id and not gateway_session_key:
+            # Default the long-term memory scope to the end user when the
+            # caller didn't pin one explicitly via X-Hermes-Session-Key.
+            gateway_session_key = f"avocado:{avocado_user_id}"
+        mcp_header_overrides = (
+            {"avocado": {"Authorization": f"Bearer {avocado_mcp_key}"}}
+            if avocado_mcp_key else None
+        )
+
         # Allow caller to continue an existing session by passing X-Hermes-Session-Id.
         # When provided, history is loaded from state.db instead of from the request body.
         #
@@ -1831,7 +1902,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 if cm.get("role") == "user":
                     first_user = cm.get("content", "")
                     break
-            session_id = _derive_chat_session_id(system_prompt, first_user)
+            session_id = _derive_chat_session_id(
+                system_prompt, first_user, identity=avocado_user_id or "",
+            )
             # history already set from request body above
 
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
@@ -1920,6 +1993,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_complete_callback=_on_tool_complete,
                 agent_ref=agent_ref,
                 gateway_session_key=gateway_session_key,
+                mcp_header_overrides=mcp_header_overrides,
             ))
             # Ensure SSE drain loops can terminate without relying on polling
             # agent_task.done(), which can race with queue timeout checks.
@@ -1939,6 +2013,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 ephemeral_system_prompt=system_prompt,
                 session_id=session_id,
                 gateway_session_key=gateway_session_key,
+                mcp_header_overrides=mcp_header_overrides,
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
@@ -3495,9 +3570,15 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_complete_callback=None,
         agent_ref: Optional[list] = None,
         gateway_session_key: Optional[str] = None,
+        mcp_header_overrides: Optional[Dict[str, Dict[str, str]]] = None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
+
+        AVOCADO FORK: ``mcp_header_overrides`` ({server_name: {header: value}})
+        scopes MCP connections to the requesting end user for this run only —
+        set as a contextvar inside the worker thread so the MCP tool handler
+        routes calls to a per-user pooled connection. Values are never logged.
 
         Returns ``(result_dict, usage_dict)`` where *usage_dict* contains
         ``input_tokens``, ``output_tokens`` and ``total_tokens``.
@@ -3518,6 +3599,22 @@ class APIServerAdapter(BasePlatformAdapter):
                 session_key=gateway_session_key or session_id or "",
                 session_id=session_id or "",
             )
+            # AVOCADO FORK: contextvars don't propagate into executor
+            # threads, so the per-user MCP override is set here, in the
+            # same thread that runs the agent (and therefore its tool
+            # handlers), and cleared in the finally below.
+            override_token = None
+            if mcp_header_overrides:
+                try:
+                    from tools.mcp_tool import set_mcp_header_overrides
+                    override_token = set_mcp_header_overrides(mcp_header_overrides)
+                except Exception:
+                    logger.warning(
+                        "Failed to apply per-request MCP header overrides "
+                        "(proceeding WITHOUT them would bill the wrong "
+                        "tenant) — aborting run.",
+                    )
+                    raise
             try:
                 agent = self._create_agent(
                     ephemeral_system_prompt=ephemeral_system_prompt,
@@ -3549,6 +3646,12 @@ class APIServerAdapter(BasePlatformAdapter):
                     result["session_id"] = _eff_sid
                 return result, usage
             finally:
+                if override_token is not None:
+                    try:
+                        from tools.mcp_tool import reset_mcp_header_overrides
+                        reset_mcp_header_overrides(override_token)
+                    except Exception:
+                        pass
                 clear_session_vars(tokens)
 
         return await loop.run_in_executor(None, _run)

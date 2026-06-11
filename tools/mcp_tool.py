@@ -79,6 +79,9 @@ Thread safety:
 
 import asyncio
 import concurrent.futures
+import contextvars
+import copy
+import hashlib
 import inspect
 import json
 import logging
@@ -1987,6 +1990,129 @@ class MCPServerTask:
 
 _servers: Dict[str, MCPServerTask] = {}
 
+# ---------------------------------------------------------------------------
+# AVOCADO FORK DIVERGENCE: per-request MCP header overrides (multi-tenant).
+#
+# The Avocado app proxies many end users through ONE gateway profile's API
+# server. Each user must hit the Avocado MCP with their OWN bearer key so
+# generations bill THEIR account. Connections in ``_servers`` bake auth
+# headers in at connect time, so a plain header swap can't work — instead the
+# API server sets this contextvar for the duration of an agent run, and the
+# tool handler routes calls to a per-override pooled connection keyed by a
+# fingerprint of the override headers (lazily connected on first use).
+#
+# Shape: {server_name: {header_name: header_value}} or None.
+# Set/reset ONLY via the helpers below. Header VALUES are never logged.
+# ---------------------------------------------------------------------------
+_MCP_HEADER_OVERRIDES_VAR: "contextvars.ContextVar[Optional[Dict[str, Dict[str, str]]]]" = (
+    contextvars.ContextVar("hermes_mcp_header_overrides", default=None)
+)
+# Guards concurrent lazy connects for the same override fingerprint.
+_override_connect_lock = threading.Lock()
+
+
+def set_mcp_header_overrides(
+    overrides: Optional[Dict[str, Dict[str, str]]],
+) -> "contextvars.Token":
+    """Set per-request MCP header overrides for the current context.
+
+    Returns a token for :func:`reset_mcp_header_overrides`. Call from the
+    same thread that will run the agent (contextvars are not propagated
+    into ``run_in_executor`` threads automatically).
+    """
+    return _MCP_HEADER_OVERRIDES_VAR.set(overrides or None)
+
+
+def reset_mcp_header_overrides(token: "contextvars.Token") -> None:
+    """Clear overrides previously set by :func:`set_mcp_header_overrides`."""
+    try:
+        _MCP_HEADER_OVERRIDES_VAR.reset(token)
+    except Exception:  # pragma: no cover — token from another context
+        _MCP_HEADER_OVERRIDES_VAR.set(None)
+
+
+def _resolve_effective_server(server_name: str) -> tuple:
+    """Map ``server_name`` to its override-scoped pool entry, if any.
+
+    Returns ``(effective_pool_name, error_json_or_None)``. Without an
+    active override for this server, returns ``(server_name, None)`` —
+    the exact pre-fork behavior.
+
+    With an override: derive a stable pool key from the override-header
+    fingerprint, lazily connect a dedicated MCPServerTask using the
+    server's base config with the override headers merged in
+    (case-insensitive replacement), and return the pool key. FAIL CLOSED:
+    if the override connection cannot be established, return an error
+    instead of falling back to the default connection — falling back
+    would silently bill the wrong tenant's account.
+    """
+    overrides = _MCP_HEADER_OVERRIDES_VAR.get()
+    if not overrides:
+        return server_name, None
+    hdrs = overrides.get(server_name)
+    if not isinstance(hdrs, dict) or not hdrs:
+        return server_name, None
+
+    fp = hashlib.sha256(
+        json.dumps(sorted(hdrs.items()), ensure_ascii=False).encode("utf-8")
+    ).hexdigest()[:12]
+    pool_key = f"{server_name}#u{fp}"
+
+    with _lock:
+        existing = _servers.get(pool_key)
+    if existing is not None and existing.session:
+        return pool_key, None
+
+    base_cfg = _load_mcp_config().get(server_name)
+    if not isinstance(base_cfg, dict) or not base_cfg.get("url"):
+        return server_name, json.dumps({
+            "error": (
+                f"MCP server '{server_name}' is not configured with an HTTP "
+                "url, so per-request auth overrides cannot be applied."
+            )
+        }, ensure_ascii=False)
+
+    cfg = copy.deepcopy(base_cfg)
+    override_lower = {k.lower() for k in hdrs}
+    merged = {
+        k: v for k, v in (cfg.get("headers") or {}).items()
+        if k.lower() not in override_lower
+    }
+    merged.update(hdrs)
+    cfg["headers"] = merged
+
+    connect_timeout = float(cfg.get("connect_timeout", _DEFAULT_CONNECT_TIMEOUT))
+    with _override_connect_lock:
+        # Double-check after acquiring the connect lock — another agent
+        # thread may have connected this fingerprint while we waited.
+        with _lock:
+            existing = _servers.get(pool_key)
+        if existing is not None and existing.session:
+            return pool_key, None
+        try:
+            server = _run_on_mcp_loop(
+                lambda: _connect_server(pool_key, cfg),
+                timeout=connect_timeout + 10,
+            )
+        except Exception as exc:
+            # Never include header values; the fingerprint is safe.
+            logger.warning(
+                "Per-request MCP override connect failed for %s (fp=%s): %s",
+                server_name, fp, type(exc).__name__,
+            )
+            return server_name, json.dumps({
+                "error": (
+                    f"Could not connect to MCP server '{server_name}' with "
+                    "the per-request credentials (key invalid/expired, or "
+                    "server unreachable). The request was NOT retried with "
+                    "fallback credentials."
+                )
+            }, ensure_ascii=False)
+        with _lock:
+            _servers[pool_key] = server
+    return pool_key, None
+
+
 # Circuit breaker: consecutive error counts per server.  After
 # _CIRCUIT_BREAKER_THRESHOLD consecutive failures, the handler returns
 # a "server unreachable" message that tells the model to stop retrying,
@@ -2610,15 +2736,22 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
         # failure the error paths below bump the count again, which
         # re-stamps the open-time via _bump_server_error (re-arming
         # the cooldown).
-        if _server_error_counts.get(server_name, 0) >= _CIRCUIT_BREAKER_THRESHOLD:
-            opened_at = _server_breaker_opened_at.get(server_name, 0.0)
+        # AVOCADO FORK: route to a per-request override connection when the
+        # API server has set header overrides for this server (multi-tenant
+        # per-user MCP keys). Without overrides this is a no-op passthrough.
+        effective_name, override_err = _resolve_effective_server(server_name)
+        if override_err is not None:
+            return override_err
+
+        if _server_error_counts.get(effective_name, 0) >= _CIRCUIT_BREAKER_THRESHOLD:
+            opened_at = _server_breaker_opened_at.get(effective_name, 0.0)
             age = time.monotonic() - opened_at
             if age < _CIRCUIT_BREAKER_COOLDOWN_SEC:
                 remaining = max(1, int(_CIRCUIT_BREAKER_COOLDOWN_SEC - age))
                 return json.dumps({
                     "error": (
                         f"MCP server '{server_name}' is unreachable after "
-                        f"{_server_error_counts[server_name]} consecutive "
+                        f"{_server_error_counts[effective_name]} consecutive "
                         f"failures. Auto-retry available in ~{remaining}s. "
                         f"Do NOT retry this tool yet — use alternative "
                         f"approaches or ask the user to check the MCP server."
@@ -2627,9 +2760,9 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             # Cooldown elapsed → fall through as a half-open probe.
 
         with _lock:
-            server = _servers.get(server_name)
+            server = _servers.get(effective_name)
         if not server or not server.session:
-            _bump_server_error(server_name)
+            _bump_server_error(effective_name)
             return json.dumps({
                 "error": f"MCP server '{server_name}' is not connected"
             }, ensure_ascii=False)
@@ -2693,11 +2826,11 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             try:
                 parsed = json.loads(result)
                 if "error" in parsed:
-                    _bump_server_error(server_name)
+                    _bump_server_error(effective_name)
                 else:
-                    _reset_server_error(server_name)  # success — reset
+                    _reset_server_error(effective_name)  # success — reset
             except (json.JSONDecodeError, TypeError):
-                _reset_server_error(server_name)  # non-JSON = success
+                _reset_server_error(effective_name)  # non-JSON = success
             return result
         except InterruptedError:
             return _interrupted_call_result()
@@ -2706,7 +2839,7 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             # reconnect if viable, retry once. Returns None to fall
             # through for non-auth exceptions.
             recovered = _handle_auth_error_and_retry(
-                server_name, exc, _call_once,
+                effective_name, exc, _call_once,
                 f"tools/call {tool_name}",
             )
             if recovered is not None:
@@ -2716,13 +2849,13 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             # but skips OAuth recovery because the access token is
             # still valid — only the server-side session is stale.
             recovered = _handle_session_expired_and_retry(
-                server_name, exc, _call_once,
+                effective_name, exc, _call_once,
                 f"tools/call {tool_name}",
             )
             if recovered is not None:
                 return recovered
 
-            _bump_server_error(server_name)
+            _bump_server_error(effective_name)
             logger.error(
                 "MCP tool %s/%s call failed: %s",
                 server_name, tool_name, exc,
