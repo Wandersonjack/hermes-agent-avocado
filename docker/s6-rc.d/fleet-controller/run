@@ -1,0 +1,23 @@
+#!/command/with-contenv sh
+# shellcheck shell=sh
+# AVOCADO FORK: fleet controller — self-serve tenant provisioning API.
+# Supervised s6 service; see provisioner/server.py for the contract.
+# Inert unless FLEET_PROVISION_SECRET is set (mirrors the dashboard
+# service's disabled-state pattern: clean exit + finish returns 125 so
+# s6 marks the slot permanently down instead of flapping).
+
+if [ -z "${FLEET_PROVISION_SECRET:-}" ]; then
+    exit 0
+fi
+
+# with-contenv repopulates HOME from /init as /root. Reset it before
+# dropping privileges so HOME-anchored state lands under /opt/data.
+export HOME=/opt/data
+
+cd /opt/data
+# shellcheck disable=SC1091
+. /opt/hermes/.venv/bin/activate
+
+# Skip the drop when already non-root.
+[ "$(id -u)" = 0 ] || exec python /opt/hermes/provisioner/server.py
+exec s6-setuidgid hermes python /opt/hermes/provisioner/server.py

@@ -1,0 +1,12 @@
+#!/command/with-contenv sh
+# shellcheck shell=sh
+# AVOCADO FORK: fleet controller finish script. Companion to ./run.
+# Mirrors the dashboard pattern: when FLEET_PROVISION_SECRET is unset,
+# ./run exits 0 and we return 125 ("permanent failure, do not restart")
+# so the slot reports down instead of flap-restarting. When the secret
+# IS set, exit 0 so s6-supervise restarts the controller on crash.
+
+if [ -n "${FLEET_PROVISION_SECRET:-}" ]; then
+    exit 0
+fi
+exit 125

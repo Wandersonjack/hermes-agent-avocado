@@ -127,22 +127,50 @@ Idempotent. On success the gateway registers a dynamic s6 service slot at
   credits to THEIR Avocado account. No FAL/Anthropic/ElevenLabs keys in Hermes.
 - Allowlist: TELEGRAM_ALLOWED_USERS locks each bot to the customer's own Telegram ID.
 
-## NEXT BUILD on the Avocado side — self-serve provisioning (Part D)
-Turn the manual shell command into a customer-facing button:
-1. Add provisioner/server.py to the fork as a supervised s6 service (not yet present),
-   guarded by PROVISIONER_SECRET, exposed only on Railway's PRIVATE network.
-2. Avocado backend endpoint POST /api/hermes/provision that:
-   - mints an Avocado MCP key scoped to the customer's account,
-   - creates a $10-capped OpenRouter key (OpenRouter provisioning API),
-   - calls the Hermes sidecar over the private network with SLUG + the 4 secrets.
-3. Supabase registry table: (customer_id, slug, telegram_user_id, bot_username,
-   openrouter_key_id, avocado_mcp_key_id, status, created_at).
-4. UI: "Connect your Telegram agent" — customer pastes their BotFather token +
-   numeric Telegram ID; backend does the rest. Same engine as the shell command,
-   driven over HTTP.
+## Part D — self-serve provisioning: FLEET CONTROLLER (BUILT 2026-06-12)
+provisioner/server.py — an aiohttp service supervised by s6
+(docker/s6-rc.d/fleet-controller), inert unless FLEET_PROVISION_SECRET is set.
+The Avocado app drives it; no more manual `railway ssh` provisioning.
+
+API (auth: Authorization: Bearer $FLEET_PROVISION_SECRET):
+- POST /provision   {tenantId, botToken, botUsername?, avocadoMcpKey, pairingCode}
+  → idempotent; registers the tenant UNPAIRED and starts a pairing poller.
+- POST /deprovision {tenantId} → stop gateway, delete profile, 200 even if gone.
+- GET  /health      → {"ok":true, "unpaired":N, "paired":N} (no auth).
+
+Pairing design (deliberate — NO changes to the Telegram adapter): the Hermes
+profile is only created at PAIRING SUCCESS. While unpaired, the controller
+itself long-polls the bot token with raw getUpdates and understands exactly
+one command, `/start <code>`:
+- /start <code> → POST $AVOCADO_APP_URL/api/super-agent/channels/telegram/pair
+  {tenantId, pairingCode, telegramUserId} with the same bearer secret.
+  200 → stop poller, create profile (mirrors pilot-1: creative-safe toolset,
+  manual approvals, tenant's avk key in mcp_servers.avocado, NO OpenRouter key
+  — inherits the shared fleet key), write .env with TELEGRAM_ALLOWED_USERS
+  locked to the paired sender, `hermes -p <slug> gateway start`, welcome msg.
+  403 → "wrong code", stays unpaired. Other/unreachable → transient message.
+- anything else → "This agent is private. Connect it from your Avocado
+  account." (rate-limited per chat).
+An unpaired bot therefore can never reach the agent/model/MCP. Poller stops
+BEFORE gateway start (two getUpdates consumers on one token = 409 fight).
+
+State: $HERMES_HOME/fleet/registry.json (0600, atomic writes). On controller
+restart, unpaired pollers resume; paired profiles are revived by the
+container_boot fork patch. Tenant slug = deterministic
+`t-<sanitized-tenantId>-<sha8>` (injective despite lowercase sanitize).
+
+Deployment knobs (Railway service variables):
+- FLEET_PROVISION_SECRET (required; service is inert without it)
+- AVOCADO_APP_URL (e.g. https://avocadoai.co — no trailing slash)
+- FLEET_CONTROLLER_PORT (default 8800) — expose via a Railway domain
+  targeting this port. The API server (8642) keeps its own domain.
+- FLEET_DEFAULT_MODEL / FLEET_MAX_ITER (optional overrides)
+
+App-side pieces (live in the Avocado repo): token verify (getMe) + encrypt,
+avk_ key mint, pairing-code issue/verify endpoint, status row flip to
+"connected" after the pair callback.
 
 ## Open items / gotchas
-- provisioner/server.py does NOT exist yet — build it for Part D.
 - Keep AUTO_UPDATE=false so a paid customer's bot never breaks from an unattended
   upstream pull. Re-sync to upstream deliberately, then re-test the 3 fork patches
   above (VOLUME removal, CMD, model default) since they diverge from upstream.
